@@ -62,9 +62,11 @@ class PositionCodeField(nn.Module):
         proj = proj / proj.norm(dim=0, keepdim=True).clamp_min(1e-6)
         self.register_buffer("bit_projection", proj, persistent=True)
 
+        # Non-integer, channel-specific frequencies avoid identical codes at the
+        # opposite image borders (a failure mode of integer-period Fourier grids).
         c = torch.arange(self.code_dim, dtype=torch.float32)
-        fx = 1.0 + torch.remainder(c, self.fourier_bands)
-        fy = 1.0 + torch.remainder(torch.floor(c / self.fourier_bands), self.fourier_bands)
+        fx = 0.73 + 0.61 * torch.remainder(c, self.fourier_bands)
+        fy = 1.11 + 0.47 * torch.remainder(torch.floor(c / self.fourier_bands), self.fourier_bands)
         phase = 2.0 * math.pi * (c + 0.5) / max(self.code_dim, 1)
         self.register_buffer("freq_x", fx, persistent=True)
         self.register_buffer("freq_y", fy, persistent=True)
@@ -85,7 +87,11 @@ class PositionCodeField(nn.Module):
         fx = self.freq_x.to(device=device, dtype=dtype).view(1, -1, 1, 1)
         fy = self.freq_y.to(device=device, dtype=dtype).view(1, -1, 1, 1)
         phase = self.phase.to(device=device, dtype=dtype).view(1, -1, 1, 1)
-        carrier = torch.sin(math.pi * fx * xx.view(1, 1, h, w) + math.pi * fy * yy.view(1, 1, h, w) + phase)
+        carrier = torch.sin(
+            math.pi * fx * xx.view(1, 1, h, w)
+            + math.pi * fy * yy.view(1, 1, h, w)
+            + phase
+        )
 
         # Message identity shifts the local carrier; both message and coordinate are required.
         return torch.tanh(msg + 0.75 * carrier)
