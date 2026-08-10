@@ -1,0 +1,85 @@
+project:
+  name: OpenPatch-PTW
+  output_dir: outputs/openpatch_ptw
+
+upstream:
+  root: third_party/GenPTW
+  vae: third_party/GenPTW/vae
+  checkpoint_dir: third_party/GenPTW/Checkpoint
+  convnext: third_party/GenPTW/pytorch_model.bin
+  lama: third_party/GenPTW/big-lama.pt
+  sd_inpaint: third_party/GenPTW/sd2-inpainting
+
+data:
+  train_img_dir: /data/COCO2017/train2017
+  train_ann_file: /data/COCO2017/annotations/instances_train2017.json
+  val_img_dir: /data/COCO2017/val2017
+  val_ann_file: /data/COCO2017/annotations/instances_val2017.json
+  resolution: 512
+  num_workers: 4
+
+model:
+  bit_dim: 64
+  code_dim: 8
+  fourier_bands: 4
+  hidden_dim: 64
+  localizer_pretrained: true
+  status_hidden_dim: 128
+
+train:
+  seed: 2026
+  batch_size: 2
+  gradient_accumulation_steps: 8
+  learning_rate: 1.0e-5
+  weight_decay: 0.01
+  warmup_new_modules_steps: 5000
+  finetune_steps: 30000
+  mixed_precision: bf16
+  save_every: 1000
+  eval_every: 1000
+  max_grad_norm: 1.0
+
+sample_mix:
+  valid: 0.50
+  unwatermarked: 0.25
+  forged: 0.25
+  online_expensive_edit_prob: 0.20
+
+mask:
+  bins:
+    - [0.01, 0.05, 0.25]
+    - [0.05, 0.15, 0.35]
+    - [0.15, 0.30, 0.25]
+    - [0.30, 0.50, 0.15]
+  shapes:
+    coco: 0.35
+    rectangle: 0.25
+    brush: 0.25
+    thin: 0.15
+
+attacks:
+  residual_beta: [0.5, 1.5]
+  train_forgery_types:
+    - residual_transfer
+    - cross_image_patch
+  heldout_forgery_type: copy_move
+
+loss:
+  wm: 5.0
+  lpips: 1.0
+  rec: 0.5
+  mask_bce: 1.0
+  edge: 20.0
+  jnd: 1.5
+  code: 1.0
+  status: 1.0
+  dice: 1.0
+
+eval:
+  threshold: 0.5
+  open_set_samples_per_class: 1000
+  tamper_area_bins:
+    - [0.01, 0.05]
+    - [0.05, 0.15]
+    - [0.15, 0.30]
+    - [0.30, 0.50]
