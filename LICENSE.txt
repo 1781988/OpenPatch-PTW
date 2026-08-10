@@ -1,0 +1,22 @@
+NON-COMMERCIAL RESEARCH LICENSE
+
+Copyright (c) 2026 OpenPatch-PTW Contributors
+
+This repository is an academic derivative/extension built on GenPTW. Permission is granted, free of charge, solely for academic and non-commercial research purposes, to use, copy, modify, merge, publish, and distribute this software, subject to the following conditions:
+
+1. Non-Commercial Use Only.
+   The Software and derivative works may NOT be used for commercial products or services, paid APIs/SaaS, internal commercial deployment, or revenue-generating activities.
+
+2. Academic Use Allowed.
+   The Software may be used for academic research, teaching, and non-profit educational purposes.
+
+3. Attribution Requirement.
+   Any use or redistribution must retain this notice and the attribution to the original GenPTW project and authors documented in THIRD_PARTY_NOTICE.md.
+
+4. Derivative Works.
+   Derivative works must remain under the same non-commercial research restriction.
+
+5. No Warranty.
+   THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND.
+
+END OF TERMS
