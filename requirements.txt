@@ -6,3 +6,4 @@ numpy>=1.24
 Pillow>=10.0
 tqdm>=4.66
 gdown>=5.0
+pytest>=8.0
