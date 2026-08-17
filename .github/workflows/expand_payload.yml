@@ -28,8 +28,6 @@ jobs:
           echo "f3716519a9514c613e685c62eace165556b62ecaa711dcea3eaadfd09e3f8a2c  /tmp/openpatch_payload.tar.gz" | sha256sum -c -
           tar -xzf /tmp/openpatch_payload.tar.gz -C .
           chmod +x scripts/*.sh
-          rm -rf tools/payload
-          rm -f .github/workflows/expand_payload.yml
 
       - name: Validate Python syntax
         run: python -m compileall -q .
@@ -41,6 +39,9 @@ jobs:
           git config user.name "OpenPatch Bot"
           git config user.email "actions@users.noreply.github.com"
           git add -A
+          # Keep payload/workflow paths outside the bot commit. They are cleaned
+          # after the source expansion through the repository API.
+          git reset HEAD -- .github/workflows tools/payload
           if git diff --cached --quiet; then
             echo "No source changes to commit."
             exit 0
