@@ -1,6 +1,7 @@
 project:
   name: OpenPatch-PTW
-  output_dir: outputs/openpatch_ptw
+  run_name: icassp_main
+  output_dir: outputs
 
 upstream:
   root: third_party/GenPTW
@@ -11,10 +12,17 @@ upstream:
   sd_inpaint: third_party/GenPTW/sd2-inpainting
 
 data:
-  train_img_dir: /data/COCO2017/train2017
-  train_ann_file: /data/COCO2017/annotations/instances_train2017.json
-  val_img_dir: /data/COCO2017/val2017
-  val_ann_file: /data/COCO2017/annotations/instances_val2017.json
+  train_img_dir: data/COCO2017/train2017
+  train_ann_file: data/COCO2017/annotations/instances_train2017.json
+  test_img_dir: data/COCO2017/val2017
+  test_ann_file: data/COCO2017/annotations/instances_val2017.json
+  manifests_dir: data/manifests
+  train_manifest: data/manifests/train_ids.txt
+  dev_manifest: data/manifests/dev_ids.txt
+  test_manifest: data/manifests/test_ids.txt
+  train_max_images: 50000
+  dev_max_images: 1000
+  test_max_images: 5000
   resolution: 512
   num_workers: 4
 
@@ -22,28 +30,46 @@ model:
   bit_dim: 64
   code_dim: 8
   fourier_bands: 4
-  hidden_dim: 64
-  localizer_pretrained: true
   status_hidden_dim: 128
+  localizer_pretrained: true
+  keep_base_sf: true
+  enable_position: true
+  enable_consistency: true
+
+experiment:
+  use_multiscale_masks: true
+  use_position_code: true
+  use_consistency: true
+  use_status: true
+  use_forgery_training: true
 
 train:
   seed: 2026
+  deterministic: false
   batch_size: 2
   gradient_accumulation_steps: 8
   learning_rate: 1.0e-5
+  betas: [0.9, 0.999]
+  epsilon: 1.0e-8
   weight_decay: 0.01
-  warmup_new_modules_steps: 5000
-  finetune_steps: 30000
+  lr_warmup_steps: 200
   mixed_precision: bf16
+  max_grad_norm: 1.0
+  finetune_base_sf: false
+  steps:
+    smoke: 200
+    warmup: 5000
+    finetune: 30000
   save_every: 1000
   eval_every: 1000
-  max_grad_norm: 1.0
+  visual_every: 1000
+  dev_batches: 8
 
 sample_mix:
   valid: 0.50
   unwatermarked: 0.25
   forged: 0.25
-  online_expensive_edit_prob: 0.20
+  valid_local_edit_prob: 0.50
 
 mask:
   bins:
@@ -51,35 +77,62 @@ mask:
     - [0.05, 0.15, 0.35]
     - [0.15, 0.30, 0.25]
     - [0.30, 0.50, 0.15]
+  coco_prob: 0.35
   shapes:
-    coco: 0.35
     rectangle: 0.25
-    brush: 0.25
-    thin: 0.15
+    ellipse: 0.15
+    brush: 0.40
+    thin: 0.20
+
+degradation:
+  probability: 0.50
+  train_choices: [noise, blur, brightness, contrast, resize]
 
 attacks:
   residual_beta: [0.5, 1.5]
-  train_forgery_types:
-    - residual_transfer
-    - cross_image_patch
+  train_forgery_types: [residual_transfer, cross_image_patch]
   heldout_forgery_type: copy_move
+
+quality:
+  use_lpips: true
+  use_jnd: true
+  lpips_net: vgg
 
 loss:
   wm: 5.0
-  lpips: 1.0
   rec: 0.5
-  mask_bce: 1.0
-  edge: 20.0
+  lpips: 1.0
   jnd: 1.5
+  mask: 1.0
+  edge: 4.0
+  dice: 1.0
+  max_pos_weight: 20.0
   code: 1.0
   status: 1.0
-  dice: 1.0
 
 eval:
+  batch_size: 2
+  max_samples: 1000
+  num_visuals: 4
   threshold: 0.5
-  open_set_samples_per_class: 1000
   tamper_area_bins:
     - [0.01, 0.05]
     - [0.05, 0.15]
     - [0.15, 0.30]
     - [0.30, 0.50]
+  common_attacks:
+    - {name: clean, kwargs: {}}
+    - {name: noise, kwargs: {sigma: 0.03}}
+    - {name: blur, kwargs: {kernel: 5, sigma: 1.2}}
+    - {name: brightness, kwargs: {factor: 1.2}}
+    - {name: contrast, kwargs: {factor: 1.2}}
+    - {name: resize, kwargs: {scale: 0.75}}
+    - {name: jpeg, kwargs: {quality: 90}}
+    - {name: jpeg, kwargs: {quality: 70}}
+    - {name: jpeg, kwargs: {quality: 50}}
+  residual_beta_grid: [0.5, 0.75, 1.0, 1.25, 1.5]
+  real_edit_methods: [lama, sd_inpaint]
+  real_edit_max_samples: 200
+  inpaint_prompt: ""
+  inpaint_strength: 1.0
+  inpaint_steps: 25

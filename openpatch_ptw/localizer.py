@@ -1,19 +1,18 @@
 from __future__ import annotations
 
-import os
-import sys
 from typing import Dict, Optional
 
+import timm
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import timm
 
 
 def _import_upstream_ops():
     try:
         from Localizer.high_frequency_feature_extraction import HighDctFrequencyExtractor
         from model_utils import GatedRes
+
         return HighDctFrequencyExtractor, GatedRes
     except ImportError as exc:
         raise ImportError(
@@ -23,9 +22,11 @@ def _import_upstream_ops():
 
 
 class OpenPatchConvNeXt(timm.models.convnext.ConvNeXt):
-    """ConvNeXt-Tiny backbone with 5 input channels.
+    """Official 4-channel GenPTW ConvNeXt plus a zero-init consistency stem.
 
-    Channels: 3 high-frequency RGB + 1 watermark feature + 1 consistency map.
+    Keeping the original 4-channel stem unchanged makes the initial output exactly
+    compatible with the GenPTW localizer. The fifth cue is injected through a
+    separate trainable projection rather than expanding and perturbing the old stem.
     """
 
     def __init__(self, conv_pretrain: bool = False, conv_ckpt: Optional[str] = None):
@@ -39,8 +40,8 @@ class OpenPatchConvNeXt(timm.models.convnext.ConvNeXt):
             self.load_state_dict(base.state_dict(), strict=False)
 
         old = self.stem[0]
-        new = nn.Conv2d(
-            5,
+        four_channel = nn.Conv2d(
+            4,
             old.out_channels,
             kernel_size=old.kernel_size,
             stride=old.stride,
@@ -48,23 +49,30 @@ class OpenPatchConvNeXt(timm.models.convnext.ConvNeXt):
             bias=False,
         )
         with torch.no_grad():
-            new.weight[:, :3].copy_(old.weight[:, :3])
-            mean = old.weight[:, :3].mean(dim=1, keepdim=True)
-            new.weight[:, 3:4].copy_(mean)
-            new.weight[:, 4:5].copy_(mean)
-        self.stem[0] = new
+            four_channel.weight[:, :3].copy_(old.weight[:, :3])
+            four_channel.weight[:, 3:4].copy_(old.weight[:, :3].mean(dim=1, keepdim=True))
+        self.stem[0] = four_channel
+        self.consistency_stem = nn.Conv2d(
+            1,
+            old.out_channels,
+            kernel_size=old.kernel_size,
+            stride=old.stride,
+            padding=old.padding,
+            bias=False,
+        )
+        nn.init.zeros_(self.consistency_stem.weight)
 
-    def forward_features(self, x):
-        x = self.stem(x)
-        outs = []
+    def forward_features(self, base_input: torch.Tensor, consistency: torch.Tensor):
+        x = self.stem[0](base_input) + self.consistency_stem(consistency)
+        x = self.stem[1](x)
+        outputs = []
         for stage in self.stages:
             x = stage(x)
-            outs.append(x)
-        x = self.norm_pre(x)
-        return x, outs
+            outputs.append(x)
+        return self.norm_pre(x), outputs
 
-    def forward(self, x):
-        return self.forward_features(x)
+    def forward(self, base_input: torch.Tensor, consistency: torch.Tensor):
+        return self.forward_features(base_input, consistency)
 
 
 class MaskDecoder(nn.Module):
@@ -101,6 +109,7 @@ class OpenPatchLocalizer(nn.Module):
         image_size: int = 512,
         conv_pretrain: bool = False,
         conv_ckpt: Optional[str] = None,
+        enable_consistency: bool = True,
     ):
         super().__init__()
         HighDctFrequencyExtractor, _ = _import_upstream_ops()
@@ -108,57 +117,66 @@ class OpenPatchLocalizer(nn.Module):
         self.convnext = OpenPatchConvNeXt(conv_pretrain=conv_pretrain, conv_ckpt=conv_ckpt)
         self.maskdecoder = MaskDecoder()
         self.resize = nn.Upsample(size=(image_size, image_size), mode="bilinear", align_corners=False)
+        self.enable_consistency = bool(enable_consistency)
+
+    def set_consistency_enabled(self, enabled: bool) -> None:
+        self.enable_consistency = bool(enabled)
 
     def forward(
         self,
         image: torch.Tensor,
         wm_feature: torch.Tensor,
-        residual_map: torch.Tensor,
+        residual_map: torch.Tensor | None,
     ) -> Dict[str, torch.Tensor]:
-        high_freq = self.high_dct(image)
+        high_frequency = self.high_dct(image)
         if wm_feature.shape[-2:] != image.shape[-2:]:
             wm_feature = F.interpolate(wm_feature, image.shape[-2:], mode="bilinear", align_corners=False)
-        if residual_map.shape[-2:] != image.shape[-2:]:
+        if residual_map is None or not self.enable_consistency:
+            residual_map = torch.zeros_like(wm_feature[:, :1])
+        elif residual_map.shape[-2:] != image.shape[-2:]:
             residual_map = F.interpolate(residual_map, image.shape[-2:], mode="bilinear", align_corners=False)
-        x = torch.cat([high_freq, wm_feature.clamp(-1, 1), residual_map.clamp(0, 1)], dim=1)
-        _, outs = self.convnext(x)
-        logits = self.resize(self.maskdecoder(outs))
+        base_input = torch.cat([high_frequency, wm_feature[:, :1].clamp(-1, 1)], dim=1)
+        _, outputs = self.convnext(base_input, residual_map[:, :1].clamp(0, 1))
+        logits = self.resize(self.maskdecoder(outputs))
         return {"pred_mask_logits": logits, "pred_mask": torch.sigmoid(logits)}
 
 
-def load_genptw_localizer_weights(model: OpenPatchLocalizer, checkpoint_path: str) -> dict:
-    """Warm-start a 5-channel localizer from the official 4-channel GenPTW checkpoint.
+def _state_dict_from_file(path: str):
+    raw = torch.load(path, map_location="cpu")
+    if isinstance(raw, dict):
+        for key in ("state_dict", "model", "module"):
+            if key in raw and isinstance(raw[key], dict):
+                return raw[key]
+    return raw
 
-    The new fifth input channel is initialized as the mean of the first three
-    image channels. Shape-incompatible tensors are skipped instead of causing
-    strict=False size mismatch errors.
-    """
-    raw = torch.load(checkpoint_path, map_location="cpu")
-    state = raw.get("state_dict", raw) if isinstance(raw, dict) else raw
+
+def load_genptw_localizer_weights(
+    model: OpenPatchLocalizer,
+    checkpoint_path: str,
+    strict_min_loaded: int = 1,
+) -> dict:
+    """Load official 4-channel GenPTW localizer exactly; consistency stem stays zero."""
+    source = _state_dict_from_file(checkpoint_path)
     current = model.state_dict()
     transferred = {}
     skipped = []
-
-    for key, value in state.items():
-        k = key.replace("module.", "")
-        if k not in current:
-            skipped.append(k)
-            continue
-        if current[k].shape == value.shape:
-            transferred[k] = value
-            continue
-        if k.endswith("convnext.stem.0.weight") and value.ndim == 4 and value.shape[1] == 4:
-            expanded = current[k].clone()
-            expanded[:, :4] = value
-            expanded[:, 4:5] = value[:, :3].mean(dim=1, keepdim=True)
-            transferred[k] = expanded
-        else:
-            skipped.append(k)
-
-    msg = model.load_state_dict(transferred, strict=False)
+    for key, value in source.items():
+        key = key.replace("module.", "").replace("_orig_mod.", "")
+        candidates = [key, key.removeprefix("model."), key.removeprefix("localizer.")]
+        matched = False
+        for candidate in dict.fromkeys(candidates):
+            if candidate in current and current[candidate].shape == value.shape:
+                transferred[candidate] = value
+                matched = True
+                break
+        if not matched:
+            skipped.append(key)
+    message = model.load_state_dict(transferred, strict=False)
+    if len(transferred) < strict_min_loaded:
+        raise RuntimeError(f"No compatible localizer weights loaded from {checkpoint_path}")
     return {
         "loaded": len(transferred),
         "skipped": skipped,
-        "missing": list(msg.missing_keys),
-        "unexpected": list(msg.unexpected_keys),
+        "missing": list(message.missing_keys),
+        "unexpected": list(message.unexpected_keys),
     }

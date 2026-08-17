@@ -1,0 +1,8 @@
+project:
+  run_name: ablation_no_consistency
+experiment:
+  use_consistency: false
+model:
+  enable_consistency: false
+loss:
+  code: 0.0

@@ -1,12 +1,14 @@
-"""OpenPatch-PTW: position-bound latent watermarking extensions for GenPTW."""
+"""OpenPatch-PTW research framework."""
 
-from .position_code import FourierPositionEncoding, PositionCodeField, PositionBoundSpatialInjection
-from .heads import LocalCodeHead, OpenSetStatusHead
+__version__ = "0.2.0"
+
+from .heads import LocalCodeHead, OpenSetStatusHead, consistency_map
+from .position_code import PositionBoundSpatialInjection, PositionCodeField
 
 __all__ = [
-    "FourierPositionEncoding",
     "PositionCodeField",
     "PositionBoundSpatialInjection",
     "LocalCodeHead",
     "OpenSetStatusHead",
+    "consistency_map",
 ]

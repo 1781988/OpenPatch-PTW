@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 import sys
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Dict, Iterable
 
 import torch
 
@@ -11,7 +11,7 @@ from .position_code import PositionBoundSpatialInjection
 
 
 def add_genptw_to_path(root: str = "third_party/GenPTW") -> str:
-    root = str(Path(root).resolve())
+    root = str(Path(root).expanduser().resolve())
     if not os.path.isdir(root):
         raise FileNotFoundError(
             f"GenPTW upstream not found: {root}. Run: bash scripts/bootstrap_genptw.sh"
@@ -22,7 +22,8 @@ def add_genptw_to_path(root: str = "third_party/GenPTW") -> str:
 
 
 def _upstream_adapter_classes():
-    from aaai_final_adapter import MessageEncoder, Z_WatermarkCrossAttention, Decoder
+    from aaai_final_adapter import Decoder, MessageEncoder, Z_WatermarkCrossAttention
+
     return MessageEncoder, Z_WatermarkCrossAttention, Decoder
 
 
@@ -36,14 +37,10 @@ def inject_openpatch_adapter(
     bit_dim: int = 64,
     image_size: int = 512,
     code_dim: int = 8,
-    hidden_dim: int = 64,
     fourier_bands: int = 4,
+    enable_position: bool = True,
 ):
-    """Inject OpenPatch modules into a diffusers AutoencoderKL.
-
-    CAF1/CAF2 and the upstream message encoder are structurally preserved.
-    Only Spatial Fusion is replaced by PositionBoundSpatialInjection.
-    """
+    """Inject GenPTW CAF modules and the OpenPatch spatial fusion into a VAE."""
     MessageEncoder, Z_WatermarkCrossAttention, _ = _upstream_adapter_classes()
 
     if not hasattr(vae.decoder, "old_forward"):
@@ -61,23 +58,22 @@ def inject_openpatch_adapter(
         z_channels=256,
         bit_dim=bit_dim,
         code_dim=code_dim,
-        hidden_dim=hidden_dim,
         fourier_bands=fourier_bands,
+        enable_position=enable_position,
     )
 
     def decoder_forward_wm(self_obj, z: torch.Tensor, bit_vector: torch.Tensor):
-        sample = z
-        wm_latent_o, wm_latent_b = self_obj.watermarkEncoder(sample, bit_vector)
-        sample = sample + wm_latent_o
+        wm_latent, wm_vector = self_obj.watermarkEncoder(z, bit_vector)
+        sample = z + wm_latent
         sample = self_obj.conv_in(sample)
         sample = self_obj.mid_block(sample)
 
         z0 = self_obj.up_blocks[0](sample)
-        z0, wm0 = self_obj.watermark_0(z0, wm_latent_o)
+        z0, wm0 = self_obj.watermark_0(z0, wm_latent)
         z1 = self_obj.up_blocks[1](z0)
-        z1, wm1 = self_obj.watermark_1(z1, wm0)
+        z1, _wm1 = self_obj.watermark_1(z1, wm0)
         z2 = self_obj.up_blocks[2](z1)
-        z2, position_code = self_obj.watermark_2(z2, wm_latent_b, bit_vector)
+        z2, position_code = self_obj.watermark_2(z2, wm_vector, bit_vector)
         z3 = self_obj.up_blocks[3](z2)
 
         sample = self_obj.conv_norm_out(z3)
@@ -101,8 +97,7 @@ def inject_openpatch_adapter(
     decoder.forward_plain = decoder_forward_plain.__get__(decoder, decoder.__class__)
 
     def decode_wm(self_obj, z, bit_vector, return_dict=True):
-        z = self_obj.post_quant_conv(z)
-        values = self_obj.decoder.forward_wm(z, bit_vector)
+        values = self_obj.decoder.forward_wm(self_obj.post_quant_conv(z), bit_vector)
         if not return_dict:
             return values
         from diffusers.utils import BaseOutput
@@ -116,12 +111,16 @@ def inject_openpatch_adapter(
             position_code: torch.FloatTensor
 
         return OpenPatchDecoderOutput(
-            sample=values[0], z0=values[1], z1=values[2], z2=values[3], z3=values[4], position_code=values[5]
+            sample=values[0],
+            z0=values[1],
+            z1=values[2],
+            z2=values[3],
+            z3=values[4],
+            position_code=values[5],
         )
 
     def decode_plain(self_obj, z, return_dict=True):
-        z = self_obj.post_quant_conv(z)
-        values = self_obj.decoder.forward_plain(z)
+        values = self_obj.decoder.forward_plain(self_obj.post_quant_conv(z))
         if not return_dict:
             return values
         from diffusers.utils import BaseOutput
@@ -133,7 +132,9 @@ def inject_openpatch_adapter(
             z2: torch.FloatTensor
             z3: torch.FloatTensor
 
-        return PlainDecoderOutput(sample=values[0], z0=values[1], z1=values[2], z2=values[3], z3=values[4])
+        return PlainDecoderOutput(
+            sample=values[0], z0=values[1], z1=values[2], z2=values[3], z3=values[4]
+        )
 
     vae.decode_wm = decode_wm.__get__(vae, vae.__class__)
     vae.decode_plain = decode_plain.__get__(vae, vae.__class__)
@@ -141,49 +142,122 @@ def inject_openpatch_adapter(
 
 
 def _load_state_file(path: str) -> Dict[str, torch.Tensor]:
+    path = str(path)
     if path.endswith(".safetensors"):
         from safetensors.torch import load_file
+
         return load_file(path, device="cpu")
     raw = torch.load(path, map_location="cpu")
-    if isinstance(raw, dict) and "state_dict" in raw:
-        return raw["state_dict"]
+    if isinstance(raw, dict):
+        for key in ("state_dict", "model", "module"):
+            if key in raw and isinstance(raw[key], dict):
+                return raw[key]
+    if not isinstance(raw, dict):
+        raise TypeError(f"Unsupported checkpoint object in {path}: {type(raw)!r}")
     return raw
 
 
-def warmstart_adapter_from_genptw(vae, checkpoint_path: str) -> dict:
-    """Transfer shape-compatible official GenPTW weights.
+def _canonical_candidates(key: str) -> list[str]:
+    key = key.replace("module.", "").replace("_orig_mod.", "")
+    candidates = [key]
+    for prefix in ("vae.", "model."):
+        if key.startswith(prefix):
+            candidates.append(key[len(prefix) :])
+    if key.startswith("decoder."):
+        candidates.append(key)
+    else:
+        candidates.append("decoder." + key)
+    # Preserve order while removing duplicates.
+    return list(dict.fromkeys(candidates))
 
-    The original Spatial Fusion (`watermark_2`) is intentionally not loaded,
-    because OpenPatch replaces it with a position-bound module.
+
+def warmstart_adapter_from_genptw(vae, checkpoint_path: str, require_base_sf: bool = True) -> dict:
+    """Load official GenPTW message encoder, CAFs and original SF base branch.
+
+    The official SF is remapped to `global_proj` and `base_fuse`; the new
+    position branch remains zero-initialized.
     """
     source = _load_state_file(checkpoint_path)
     current = vae.state_dict()
-    transferred = {}
-    skipped = []
-    allowed_fragments = ("watermarkEncoder", "watermark_0", "watermark_1")
+    transferred: dict[str, torch.Tensor] = {}
+    skipped: list[str] = []
 
-    for key, value in source.items():
-        k = key.replace("module.", "")
-        if not any(fragment in k for fragment in allowed_fragments):
+    def remap(key: str) -> str:
+        key = key.replace(".watermark_2.proj.", ".watermark_2.global_proj.")
+        key = key.replace(".watermark_2.fuse.", ".watermark_2.base_fuse.")
+        return key
+
+    allowed = ("watermarkEncoder", "watermark_0", "watermark_1", "watermark_2.proj", "watermark_2.fuse")
+    for source_key, value in source.items():
+        if not any(fragment in source_key for fragment in allowed):
             continue
-        if k in current and current[k].shape == value.shape:
-            transferred[k] = value
-        else:
-            skipped.append(k)
+        matched = False
+        for candidate in _canonical_candidates(source_key):
+            candidate = remap(candidate)
+            if candidate in current and current[candidate].shape == value.shape:
+                transferred[candidate] = value
+                matched = True
+                break
+        if not matched:
+            skipped.append(source_key)
 
-    msg = vae.load_state_dict(transferred, strict=False)
+    message = vae.load_state_dict(transferred, strict=False)
+    base_loaded = sum(
+        1
+        for key in transferred
+        if "watermark_2.global_proj" in key or "watermark_2.base_fuse" in key
+    )
+    caf_loaded = sum(
+        1 for key in transferred if "watermarkEncoder" in key or "watermark_0" in key or "watermark_1" in key
+    )
+    if require_base_sf and base_loaded == 0:
+        raise RuntimeError(
+            "Official GenPTW SF weights were not loaded. Check that "
+            "diffusion_pytorch_model.safetensors is the official checkpoint."
+        )
+    if caf_loaded == 0:
+        raise RuntimeError("Official GenPTW watermark encoder/CAF weights were not loaded.")
     return {
         "loaded": len(transferred),
+        "base_sf_loaded": base_loaded,
+        "caf_loaded": caf_loaded,
         "skipped": skipped,
-        "missing": list(msg.missing_keys),
-        "unexpected": list(msg.unexpected_keys),
+        "missing": list(message.missing_keys),
+        "unexpected": list(message.unexpected_keys),
     }
 
 
-def load_message_decoder_weights(decoder, checkpoint_path: str) -> dict:
-    state = _load_state_file(checkpoint_path)
-    if isinstance(state, dict) and "model" in state:
-        state = state["model"]
-    cleaned = {k.replace("module.", ""): v for k, v in state.items()}
-    msg = decoder.load_state_dict(cleaned, strict=False)
-    return {"missing": list(msg.missing_keys), "unexpected": list(msg.unexpected_keys)}
+def load_message_decoder_weights(decoder, checkpoint_path: str, strict_min_loaded: int = 1) -> dict:
+    source = _load_state_file(checkpoint_path)
+    current = decoder.state_dict()
+    transferred = {}
+    skipped = []
+    for key, value in source.items():
+        matched = False
+        for candidate in _canonical_candidates(key):
+            if candidate in current and current[candidate].shape == value.shape:
+                transferred[candidate] = value
+                matched = True
+                break
+        if not matched:
+            skipped.append(key)
+    message = decoder.load_state_dict(transferred, strict=False)
+    if len(transferred) < strict_min_loaded:
+        raise RuntimeError(f"No compatible message-decoder weights loaded from {checkpoint_path}")
+    return {
+        "loaded": len(transferred),
+        "skipped": skipped,
+        "missing": list(message.missing_keys),
+        "unexpected": list(message.unexpected_keys),
+    }
+
+
+def set_module_requires_grad(module: torch.nn.Module, enabled: bool) -> None:
+    for parameter in module.parameters():
+        parameter.requires_grad_(enabled)
+
+
+def freeze_batch_norm_stats(module: torch.nn.Module) -> None:
+    for child in module.modules():
+        if isinstance(child, torch.nn.modules.batchnorm._BatchNorm):
+            child.eval()

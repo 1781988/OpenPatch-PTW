@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "openpatch-ptw"
+version = "0.2.0"
+description = "Position-bound latent watermarking for open-set provenance verification and tamper localization"
+requires-python = ">=3.10,<3.13"
+readme = "README.md"
+license = {file = "LICENSE.txt"}
+
+[tool.setuptools.packages.find]
+include = ["openpatch_ptw*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

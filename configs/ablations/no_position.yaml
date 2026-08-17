@@ -1,0 +1,8 @@
+project:
+  run_name: ablation_no_position
+experiment:
+  use_position_code: false
+  use_consistency: false
+model:
+  enable_position: false
+  enable_consistency: false

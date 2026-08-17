@@ -1,0 +1,6 @@
+project:
+  run_name: ablation_no_status
+experiment:
+  use_status: false
+loss:
+  status: 0.0

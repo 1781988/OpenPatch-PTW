@@ -1,0 +1,10 @@
+name: openpatch
+channels:
+  - defaults
+dependencies:
+  - python=3.10
+  - pip
+  - git
+  - unzip
+  - pip:
+      - -r requirements.txt

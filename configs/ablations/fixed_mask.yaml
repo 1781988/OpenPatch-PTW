@@ -1,0 +1,7 @@
+project:
+  run_name: ablation_fixed_mask
+experiment:
+  use_multiscale_masks: false
+mask:
+  bins:
+    - [0.15, 0.25, 1.0]
