@@ -23,7 +23,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cat tools/patch/part* > /tmp/openpatch_patch.b64
+          cat tools/patch/part1* > /tmp/openpatch_patch.b64
           base64 -d /tmp/openpatch_patch.b64 > /tmp/openpatch_patch.tar.gz
           echo "9349527297f29d378aa9316b6a96d7d571f0201a30a958a540621edd7844699a  /tmp/openpatch_patch.tar.gz" | sha256sum -c -
           tar -xzf /tmp/openpatch_patch.tar.gz -C .
