@@ -14,4 +14,19 @@ jobs:
         with:
           python-version: '3.10'
       - name: Compile Python sources
-        run: python -m compileall -q openpatch_ptw train_openpatch.py eval_openpatch.py tests
+        run: |
+          python -m compileall -q \
+            openpatch_ptw \
+            train_openpatch.py eval_openpatch.py prepare_data.py \
+            download_assets.py doctor.py run_all_experiments.py package_results.py \
+            tests
+      - name: Validate YAML
+        run: |
+          python -m pip install PyYAML
+          python - <<'PY'
+          from pathlib import Path
+          import yaml
+          for path in Path('configs').rglob('*.yaml'):
+              yaml.safe_load(path.read_text(encoding='utf-8'))
+              print('ok', path)
+          PY
