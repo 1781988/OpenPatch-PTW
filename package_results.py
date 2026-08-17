@@ -17,6 +17,8 @@ from openpatch_ptw.runtime import sha256_file, write_json
 def parse_args():
     parser = argparse.ArgumentParser("Package OpenPatch-PTW experiment outputs for analysis")
     parser.add_argument("--config", default="configs/openpatch_ptw.yaml")
+    parser.add_argument("--variant", default=None)
+    parser.add_argument("--override", action="append", default=[])
     parser.add_argument("--run-prefix", required=True)
     parser.add_argument("--output", default=None)
     parser.add_argument("--include-checkpoints", action="store_true")
@@ -105,7 +107,7 @@ def write_csv(path: Path, rows: list[dict[str, Any]]):
 
 def main():
     args = parse_args()
-    cfg = load_config(args.config)
+    cfg = load_config(args.config, args.variant, args.override)
     output_root = Path(cfg["project"]["output_dir"])
     run_dirs = sorted(path for path in output_root.glob(f"{args.run_prefix}*") if path.is_dir())
     if not run_dirs:

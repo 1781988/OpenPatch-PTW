@@ -41,7 +41,6 @@ from openpatch_ptw.models import (
     encode_decode_pair,
     extract_baseline,
     extract_openpatch,
-    sample_bits,
 )
 from openpatch_ptw.quality import image_quality_per_sample
 from openpatch_ptw.results import ResultWriter
@@ -57,6 +56,31 @@ def _attack_label(name: str, kwargs: dict) -> str:
         return name
     suffix = "_".join(f"{key}{value}" for key, value in sorted(kwargs.items()))
     return f"{name}_{suffix}"
+
+
+def _seed_for_ids(image_ids, base_seed: int, salt: int = 0) -> int:
+    """Stable 63-bit seed independent of Python hash randomization."""
+    value = (int(base_seed) + 0x9E3779B97F4A7C15 * (int(salt) + 1)) & ((1 << 63) - 1)
+    for image_id in image_ids:
+        value ^= (int(image_id) + 0x9E3779B97F4A7C15 + (value << 6) + (value >> 2)) & ((1 << 63) - 1)
+        value &= (1 << 63) - 1
+    return int(value)
+
+
+def _bits_for_image_ids(image_ids, bit_dim: int, base_seed: int, salt: int, device, dtype) -> torch.Tensor:
+    """Generate the same message for an image regardless of suite order or batch size."""
+    rows = []
+    for image_id in image_ids:
+        generator = torch.Generator(device="cpu")
+        generator.manual_seed(_seed_for_ids([image_id], base_seed, salt))
+        rows.append(torch.randint(0, 2, (bit_dim,), generator=generator, dtype=torch.int64))
+    return torch.stack(rows).to(device=device, dtype=dtype)
+
+
+def _latent_generator(image_ids, base_seed: int, salt: int, device) -> torch.Generator:
+    generator = torch.Generator(device=device)
+    generator.manual_seed(_seed_for_ids(image_ids, base_seed, salt))
+    return generator
 
 
 def parse_args():
@@ -78,8 +102,8 @@ def parse_args():
     return parser.parse_args()
 
 
-def _make_loader(cfg: dict):
-    dataset = build_dataset_from_config(cfg, "test", deterministic=True)
+def _make_loader(cfg: dict, split: str = "test"):
+    dataset = build_dataset_from_config(cfg, split, deterministic=True)
     return DataLoader(
         dataset,
         batch_size=int(cfg["eval"].get("batch_size", cfg["train"]["batch_size"])),
@@ -105,10 +129,16 @@ def _load_models(args, cfg, device):
 
 
 @torch.no_grad()
-def _pair(models, model_name: str, image: torch.Tensor, bits: torch.Tensor):
+def _pair(
+    models,
+    model_name: str,
+    image: torch.Tensor,
+    bits: torch.Tensor,
+    generator: torch.Generator | None = None,
+):
     if model_name == "openpatch":
-        return encode_decode_pair(models.vae, image, bits)[:2]
-    latent = models.vae.encode(image).latent_dist.sample() * 0.18215
+        return encode_decode_pair(models.vae, image, bits, generator=generator)[:2]
+    latent = models.vae.encode(image).latent_dist.sample(generator=generator) * 0.18215
     plain = models.vae.decode_plain(latent / 0.18215, return_dict=False)[0].clamp(-1, 1)
     watermarked = models.vae.decode_wm(latent / 0.18215, bits, return_dict=False)[0].clamp(-1, 1)
     return plain, watermarked
@@ -162,8 +192,11 @@ def suite_standard(loader, cfg, models, model_name, device, output_dir, max_samp
         image = batch["pixel_values"].to(device)
         image_ids = batch["image_ids"].tolist()
         batch_size = image.shape[0]
-        bits = sample_bits(batch_size, int(cfg["model"]["bit_dim"]), device, image.dtype)
-        plain, watermarked = _pair(models, model_name, image, bits)
+        bits = _bits_for_image_ids(
+            image_ids, int(cfg["model"]["bit_dim"]), int(cfg["train"]["seed"]), 101, device, image.dtype
+        )
+        latent_gen = _latent_generator(image_ids, int(cfg["train"]["seed"]), 1101, device)
+        plain, watermarked = _pair(models, model_name, image, bits, latent_gen)
         qualities = image_quality_per_sample(watermarked, plain, lpips_model)
         zero_mask = torch.zeros((batch_size, 1, image.shape[-2], image.shape[-1]), device=device, dtype=image.dtype)
 
@@ -236,8 +269,12 @@ def suite_small_tamper(loader, cfg, models, model_name, device, output_dir, max_
                     for image_id in image_ids
                 ]
             ).to(device)
-            bits = sample_bits(image.shape[0], int(cfg["model"]["bit_dim"]), device, image.dtype)
-            plain, watermarked = _pair(models, model_name, image, bits)
+            salt = 200 + int(float(low) * 10000)
+            bits = _bits_for_image_ids(
+                image_ids, int(cfg["model"]["bit_dim"]), int(cfg["train"]["seed"]), salt, device, image.dtype
+            )
+            latent_gen = _latent_generator(image_ids, int(cfg["train"]["seed"]), salt + 1000, device)
+            plain, watermarked = _pair(models, model_name, image, bits, latent_gen)
             edited = local_plain_replacement(watermarked, batch_roll_donor(plain), masks).image
             output = _extract(models, model_name, edited, masks)
             bit_acc = bit_accuracy_per_sample(output["decoded_bits"], bits).cpu().tolist()
@@ -276,8 +313,11 @@ def suite_open_set(loader, cfg, models, model_name, device, output_dir, max_samp
         image = batch["pixel_values"].to(device)
         mask = batch["masks"].to(device).clamp(0, 1)
         image_ids = batch["image_ids"].tolist()
-        bits = sample_bits(image.shape[0], int(cfg["model"]["bit_dim"]), device, image.dtype)
-        plain, watermarked = _pair(models, model_name, image, bits)
+        bits = _bits_for_image_ids(
+            image_ids, int(cfg["model"]["bit_dim"]), int(cfg["train"]["seed"]), 301, device, image.dtype
+        )
+        latent_gen = _latent_generator(image_ids, int(cfg["train"]["seed"]), 1301, device)
+        plain, watermarked = _pair(models, model_name, image, bits, latent_gen)
         forged = cross_image_patch_transfer(watermarked, batch_roll_donor(watermarked), mask).image
         samples = [
             ("unwatermarked", 0, plain, torch.zeros_like(mask)),
@@ -330,13 +370,19 @@ def suite_open_set(loader, cfg, models, model_name, device, output_dir, max_samp
     return writer.finalize(payload, group_keys=("target_name",))
 
 
-def _calibrate_baseline_threshold(loader, cfg, models, device, max_samples):
+def _calibrate_baseline_threshold(cfg, models, device, max_samples):
+    # Calibrate on the independent COCO-train dev manifest, never on the test set.
+    loader = _make_loader(cfg, "dev")
     scores = []
     seen = 0
     for batch in loader:
         image = batch["pixel_values"].to(device)
-        bits = sample_bits(image.shape[0], int(cfg["model"]["bit_dim"]), device, image.dtype)
-        _, watermarked = _pair(models, "genptw", image, bits)
+        image_ids = batch["image_ids"].tolist()
+        bits = _bits_for_image_ids(
+            image_ids, int(cfg["model"]["bit_dim"]), int(cfg["train"]["seed"]), 401, device, image.dtype
+        )
+        latent_gen = _latent_generator(image_ids, int(cfg["train"]["seed"]), 1401, device)
+        _, watermarked = _pair(models, "genptw", image, bits, latent_gen)
         zero = torch.zeros((image.shape[0], 1, image.shape[-2], image.shape[-1]), device=device, dtype=image.dtype)
         output = _extract(models, "genptw", watermarked, zero)
         scores.extend(output["valid_score"].cpu().tolist())
@@ -350,22 +396,25 @@ def suite_forgery(loader, cfg, models, model_name, device, output_dir, max_sampl
     writer = ResultWriter(output_dir, "forgery")
     threshold = None
     if model_name == "genptw":
-        threshold = _calibrate_baseline_threshold(loader, cfg, models, device, min(max_samples, 500))
+        threshold = _calibrate_baseline_threshold(cfg, models, device, min(max_samples, 500))
     seen = 0
     visual_states = {}
     for batch in tqdm(loader, desc=f"{model_name}:forgery"):
         image = batch["pixel_values"].to(device)
         mask = batch["masks"].to(device).clamp(0, 1)
         image_ids = batch["image_ids"].tolist()
-        bits = sample_bits(image.shape[0], int(cfg["model"]["bit_dim"]), device, image.dtype)
-        plain, watermarked = _pair(models, model_name, image, bits)
+        bits = _bits_for_image_ids(
+            image_ids, int(cfg["model"]["bit_dim"]), int(cfg["train"]["seed"]), 401, device, image.dtype
+        )
+        latent_gen = _latent_generator(image_ids, int(cfg["train"]["seed"]), 1401, device)
+        plain, watermarked = _pair(models, model_name, image, bits, latent_gen)
         donor_plain = batch_roll_donor(plain)
         donor_wm = batch_roll_donor(watermarked)
         donor_bits = batch_roll_donor(bits)
 
         attack_results = {
             "cross_image_patch": cross_image_patch_transfer(watermarked, donor_wm, mask),
-            "copy_move": copy_move(watermarked, mask, rng=random.Random(int(cfg["train"]["seed"]) + seen)),
+            "copy_move": copy_move(watermarked, mask, rng=random.Random(_seed_for_ids(image_ids, int(cfg["train"]["seed"]), 402))),
         }
         for beta in cfg["eval"]["residual_beta_grid"]:
             beta_tensor = torch.full((image.shape[0], 1, 1, 1), float(beta), device=device, dtype=image.dtype)
@@ -461,8 +510,11 @@ def suite_real_edits(loader, cfg, models, model_name, device, output_dir, max_sa
         image = batch["pixel_values"].to(device)
         mask = batch["masks"].to(device).clamp(0, 1)
         image_ids = batch["image_ids"].tolist()
-        bits = sample_bits(image.shape[0], int(cfg["model"]["bit_dim"]), device, image.dtype)
-        plain, watermarked = _pair(models, model_name, image, bits)
+        bits = _bits_for_image_ids(
+            image_ids, int(cfg["model"]["bit_dim"]), int(cfg["train"]["seed"]), 501, device, image.dtype
+        )
+        latent_gen = _latent_generator(image_ids, int(cfg["train"]["seed"]), 1501, device)
+        plain, watermarked = _pair(models, model_name, image, bits, latent_gen)
         for method in methods:
             if method == "lama":
                 if lama_model is None:
@@ -482,7 +534,9 @@ def suite_real_edits(loader, cfg, models, model_name, device, output_dir, max_sa
                     ).to(device)
                     sd_pipeline.set_progress_bar_config(disable=True)
                 outputs = []
-                for sample, sample_mask in zip(watermarked, mask):
+                for sample, sample_mask, image_id in zip(watermarked, mask, image_ids):
+                    sd_generator = torch.Generator(device=device)
+                    sd_generator.manual_seed(_seed_for_ids([image_id], int(cfg["train"]["seed"]), 2501))
                     result = sd_pipeline(
                         prompt=str(cfg["eval"].get("inpaint_prompt", "")),
                         image=TF.to_pil_image((sample / 2.0 + 0.5).clamp(0, 1).cpu()),
@@ -491,6 +545,7 @@ def suite_real_edits(loader, cfg, models, model_name, device, output_dir, max_sa
                         width=int(cfg["data"]["resolution"]),
                         strength=float(cfg["eval"].get("inpaint_strength", 1.0)),
                         num_inference_steps=int(cfg["eval"].get("inpaint_steps", 25)),
+                        generator=sd_generator,
                     ).images[0]
                     outputs.append(TF.to_tensor(result) * 2.0 - 1.0)
                 edited = torch.stack(outputs).to(device=device, dtype=watermarked.dtype)

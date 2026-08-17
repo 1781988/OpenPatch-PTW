@@ -40,15 +40,21 @@ def download_file(url: str, output: Path, force: bool = False) -> Path:
         return output
     output.parent.mkdir(parents=True, exist_ok=True)
     partial = output.with_suffix(output.suffix + ".part")
-    headers = {}
-    mode = "wb"
-    if partial.exists():
-        headers["Range"] = f"bytes={partial.stat().st_size}-"
-        mode = "ab"
+    existing = partial.stat().st_size if partial.exists() else 0
+    headers = {"Range": f"bytes={existing}-"} if existing else {}
     with requests.get(url, stream=True, timeout=60, headers=headers) as response:
         response.raise_for_status()
-        total = int(response.headers.get("content-length", 0))
-        with partial.open(mode) as handle, tqdm(total=total, unit="B", unit_scale=True, desc=output.name) as bar:
+        # Some servers ignore Range and return 200. Appending that response would
+        # silently corrupt the asset, so restart from byte zero unless status 206.
+        resumed = bool(existing and response.status_code == 206)
+        if existing and not resumed:
+            existing = 0
+        mode = "ab" if resumed else "wb"
+        remaining = int(response.headers.get("content-length", 0))
+        total = existing + remaining if remaining else None
+        with partial.open(mode) as handle, tqdm(
+            total=total, initial=existing, unit="B", unit_scale=True, desc=output.name
+        ) as bar:
             for chunk in response.iter_content(chunk_size=1 << 20):
                 if chunk:
                     handle.write(chunk)

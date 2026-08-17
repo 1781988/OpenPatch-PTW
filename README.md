@@ -35,6 +35,9 @@ OpenPatch-PTW 是一个面向 **ICASSP 投稿实验** 的潜空间主动取证�
 - 基础图像统一使用公开 COCO2017；
 - 训练掩码和廉价篡改在运行时生成；
 - 测试掩码由 `COCO image_id + 固定随机种子` 决定，重复运行一致；
+- 测试水印消息与 VAE posterior 采样也由 image ID 派生，不依赖 suite 执行顺序；
+- SD-Inpaint 为每张图像使用固定 generator seed；
+- GenPTW 的 valid threshold 只使用独立 dev manifest 校准，不使用 test 样本；
 - LaMA 和 SD-Inpaint 作为最终可选真实编辑测试，不作为快速训练的主要负担；
 - 数据划分写入 manifest，避免每次运行样本不同。
 
@@ -152,13 +155,15 @@ OpenPatch-PTW/
 - COCO2017 约 26 GB；
 - SD2 Inpainting 及缓存需要额外磁盘空间。
 
-默认分辨率为 512×512，batch size 2，梯度累积 8。显存不足时先使用：
+默认分辨率为 512×512，训练和评估 batch size 均为 2，梯度累积 8。**正式的伪造训练、开放集评估和跨图移植评估必须保持 batch size >= 2**，否则 batch 内没有真正的供体图像与供体消息。
+
+显存不足时，可以仅在 smoke 调试阶段临时使用：
 
 ```bash
 --override train.batch_size=1
 ```
 
-不要优先降低分辨率，因为原 GenPTW checkpoint 与 512 分辨率设置关联较强。
+该设置不能作为论文正式训练结果。正式运行应恢复 batch size 2；可通过关闭在线 LPIPS、减少可视化、降低 DataLoader worker 或使用更大显存 GPU 解决 OOM。不要优先降低分辨率，因为原 GenPTW checkpoint 与 512 分辨率设置关联较强。
 
 ---
 
@@ -304,7 +309,7 @@ data/manifests/
 └── dataset_report.json
 ```
 
-训练集和 dev 不重叠。manifest 保存的是 COCO image ID，不是临时数组下标。
+训练集和 dev 不重叠。manifest 保存的是 COCO image ID，不是临时数组下标。正式实验中，水印消息、VAE posterior generator、测试掩码与 SD-Inpaint generator 均由 image ID 和固定 seed 派生，因此单独运行某一 suite 与运行 `--suite all` 时使用同一批测试身份。
 
 修改样本量：
 
@@ -738,20 +743,15 @@ outputs/<run>/upstream_load_report.json
 
 ### 17.2 OOM
 
-先使用：
+仅在 smoke 链路检查时可以临时使用：
 
 ```bash
 --override train.batch_size=1 \
---override train.gradient_accumulation_steps=16
-```
-
-然后可暂时关闭 LPIPS 做链路检查：
-
-```bash
+--override train.gradient_accumulation_steps=16 \
 --override quality.use_lpips=false
 ```
 
-最终正式训练应恢复 LPIPS。
+正式伪造训练必须恢复 `train.batch_size=2`，正式开放集/伪造评估必须保持 `eval.batch_size=2`，否则 cross-image donor 会退化为同图变换，不具备论文实验意义。LPIPS 也应在最终训练与标准质量评估中恢复。
 
 ### 17.3 Google Drive checkpoint 下载失败
 

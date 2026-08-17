@@ -174,8 +174,9 @@ def encode_decode_pair(
     image: torch.Tensor,
     bits: torch.Tensor,
     scaling_factor: float = 0.18215,
+    generator: torch.Generator | None = None,
 ):
-    latents = vae.encode(image).latent_dist.sample() * scaling_factor
+    latents = vae.encode(image).latent_dist.sample(generator=generator) * scaling_factor
     plain = vae.decode_plain(latents / scaling_factor, return_dict=False)[0].clamp(-1, 1)
     wm_values = vae.decode_wm(latents / scaling_factor, bits, return_dict=False)
     watermarked = wm_values[0].clamp(-1, 1)

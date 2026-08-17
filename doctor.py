@@ -83,12 +83,24 @@ def main():
     missing_packages = [name for name, version in packages.items() if version is None]
     required_failures = [item for item in checks if item["required"] and not item["ok"]]
 
+    warnings = []
+    if bool(cfg.get("experiment", {}).get("use_forgery_training", True)) and int(cfg["train"].get("batch_size", 1)) < 2:
+        warnings.append(
+            "Formal forgery training requires train.batch_size >= 2 so donor images/messages come from a different sample. "
+            "Batch size 1 is supported only for smoke debugging."
+        )
+    if int(cfg["eval"].get("batch_size", 1)) < 2:
+        warnings.append(
+            "Formal open-set/forgery evaluation requires eval.batch_size >= 2 for true cross-image donor pairing."
+        )
+
     report = {
         "environment": environment_report(cfg["runtime"]["repo_root"]),
         "packages": packages,
         "missing_packages": missing_packages,
         "checks": checks,
         "required_failures": required_failures,
+        "warnings": warnings,
         "disk_free_gb": round(shutil.disk_usage(cfg["runtime"]["repo_root"]).free / 2**30, 2),
         "manifest_counts": {
             split: len(read_id_manifest(cfg["data"].get(f"{split}_manifest")) or [])
@@ -106,7 +118,8 @@ def main():
         bits = sample_bits(1, int(cfg["model"]["bit_dim"]), device, image.dtype)
         with torch.no_grad():
             plain, watermarked, _, values = encode_decode_pair(models.vae, image, bits)
-            output = extract_openpatch(models, watermarked, mask)
+            zero_mask = torch.zeros_like(mask)
+            output = extract_openpatch(models, watermarked, zero_mask)
         report["forward"] = {
             "ok": True,
             "image": list(image.shape),
